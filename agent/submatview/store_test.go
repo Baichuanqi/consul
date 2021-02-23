@@ -9,6 +9,10 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/require"
 
+	"github.com/hashicorp/consul/sdk/testutil/retry"
+
+	"github.com/hashicorp/consul/lib/ttlcache"
+
 	"github.com/hashicorp/consul/agent/cache"
 	"github.com/hashicorp/consul/proto/pbcommon"
 	"github.com/hashicorp/consul/proto/pbservice"
@@ -19,7 +23,7 @@ func TestStore_Get(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := NewStore()
+	store := NewStore(hclog.New(nil))
 	go store.Run(ctx)
 
 	req := &fakeRequest{
@@ -203,14 +207,77 @@ func (f *fakeView) Reset() {
 	f.srvs = make(map[string]*pbservice.CheckServiceNode)
 }
 
-// TODO: Get with Notify
-
 func TestStore_Notify(t *testing.T) {
-	// TODO: Notify with no existing entry
-	// TODO: Notify with Get
-	// TODO: Notify multiple times same key
-	// TODO: Notify no update if index is not past MinIndex.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := NewStore(hclog.New(nil))
+	go store.Run(ctx)
+
+	req := &fakeRequest{
+		client: NewTestStreamingClient(pbcommon.DefaultEnterpriseMeta.Namespace),
+	}
+	req.client.QueueEvents(
+		newEndOfSnapshotEvent(2),
+		newEventServiceHealthRegister(10, 1, "srv1"),
+		newEventServiceHealthRegister(22, 2, "srv1"))
+
+	cID := "correlate"
+	ch := make(chan cache.UpdateEvent)
+
+	err := store.Notify(ctx, req, cID, ch)
+	require.NoError(t, err)
+
+	runStep(t, "from empty store, starts materializer", func(t *testing.T) {
+		store.lock.Lock()
+		defer store.lock.Unlock()
+		require.Len(t, store.byKey, 1)
+		e := store.byKey[makeEntryKey(req.Type(), req.CacheInfo())]
+		require.Equal(t, ttlcache.NotIndexed, e.expiry.Index())
+		require.Equal(t, 1, e.requests)
+	})
+
+	runStep(t, "updates are received", func(t *testing.T) {
+		select {
+		case update := <-ch:
+			require.NoError(t, update.Err)
+			require.Equal(t, cID, update.CorrelationID)
+			require.Equal(t, uint64(22), update.Meta.Index)
+			require.Equal(t, uint64(22), update.Result.(fakeResult).index)
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("expected Get to unblock when new events are received")
+		}
+
+		req.client.QueueEvents(newEventServiceHealthRegister(24, 2, "srv1"))
+
+		select {
+		case update := <-ch:
+			require.NoError(t, update.Err)
+			require.Equal(t, cID, update.CorrelationID)
+			require.Equal(t, uint64(24), update.Meta.Index)
+			require.Equal(t, uint64(24), update.Result.(fakeResult).index)
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("expected Get to unblock when new events are received")
+		}
+	})
+
+	runStep(t, "closing the notify starts the expiry counter", func(t *testing.T) {
+		cancel()
+
+		retry.Run(t, func(r *retry.R) {
+			store.lock.Lock()
+			defer store.lock.Unlock()
+			e := store.byKey[makeEntryKey(req.Type(), req.CacheInfo())]
+			require.Equal(r, 0, e.expiry.Index())
+			require.Equal(r, 0, e.requests)
+			require.Equal(r, store.expiryHeap.Next().Entry, e.expiry)
+		})
+	})
 }
+
+// TODO: Notify with Get
+// TODO: Notify multiple times same key
+// TODO: Notify no update if index is not past MinIndex.
 
 func runStep(t *testing.T, name string, fn func(t *testing.T)) {
 	t.Helper()
